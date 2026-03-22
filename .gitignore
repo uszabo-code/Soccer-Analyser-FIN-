@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Model weights (large files — download separately)
+*.pt
+
+# Videos (large files)
+videos/
+research/eval_clip.mp4
+
+# Pipeline outputs
+output/
+output_*/
+
+# Research experiments and cache
+research/experiments/
+.cache/
+tmp_models/
+
+# Paddle model cache
+.paddlex/
+
+# Secrets (never commit)
+.env
+*.env

@@ -1,0 +1,26 @@
+# BoT-SORT config tuned for fixed-angle Finnish club camera (Veo Cam 2 / Wisemen style)
+# Overhead wide-angle, players ~80-150px tall, consistent camera motion (pans/tilts)
+
+tracker_type: botsort
+
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+fuse_score: True
+
+# Increased from 30 → 90 (3s at 30fps): players briefly occluded or off-screen
+# are reconnected on re-entry rather than getting a new track ID
+track_buffer: 90
+
+# Lowered from 0.8 → 0.7: more permissive re-linking after partial occlusion
+match_thresh: 0.7
+
+# Global Motion Compensation: compensates for camera pan/tilt (key advantage over ByteTrack)
+gmc_method: sparseOptFlow
+
+# ReID disabled: OSNet trained on close-up pedestrians, not overhead soccer players
+# GMC (sparseOptFlow) handles camera motion without ReID
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
+model: auto
