@@ -18,12 +18,16 @@ import os
 from collections import defaultdict
 
 
-# Max gap in frames to attempt merging (3s at 30fps with FRAME_SKIP=3 = 30 frames processed)
-MAX_GAP_FRAMES = 90
+# Max gap in video-frame units to attempt merging.
+# frame_num in detections.json is the raw video frame number (not processed-frame index).
+# 900 = 30s at 30fps — covers set pieces, camera cuts, brief off-screen exits.
+# Previously 90 (3s), which was tuned for low-fragmentation BoT-SORT output.
+# With football_yolov8 + BoT-SORT we still see ~140 fragments/player, so extend to 30s.
+MAX_GAP_FRAMES = 900
 
-# Max distance in pixels between last position of track A and first position of track B
-# At FRAME_SKIP=3 and 30fps, 90 frames = 3s. Walking speed ~5px/frame → 150px max
-MAX_SPATIAL_DISTANCE_PX = 300
+# Max pixel distance (at max gap). Scales linearly for shorter gaps via allowed_dist formula.
+# At 30s gap: ~1500px allowed. At 3s gap: ~150px. Guards against cross-player false merges.
+MAX_SPATIAL_DISTANCE_PX = 1500
 
 
 def _get_track_endpoints(person_detections):
@@ -207,6 +211,28 @@ def run(detections_path: str, player_identity_path: str, output_dir: str):
         print("  No player_identity.json found — skipping color-based merging")
         print("  (Run Stage 2 first to generate identity data, then re-run Stage 1b)")
         return detections_path
+
+    # Log gap distribution to inform parameter tuning
+    all_gaps = []
+    for ep_a in endpoints.values():
+        for ep_b in endpoints.values():
+            if ep_a is ep_b:
+                continue
+            if ep_a["last_frame"] < ep_b["first_frame"]:
+                gap = ep_b["first_frame"] - ep_a["last_frame"]
+                if gap > 0:
+                    all_gaps.append(gap)
+    if all_gaps:
+        all_gaps.sort()
+        n = len(all_gaps)
+        fps = det_data.get("fps", 30.0)
+        print(f"  Gap distribution (frames @ {fps:.0f}fps):")
+        print(f"    p50={all_gaps[n//2]} ({all_gaps[n//2]/fps:.1f}s)  "
+              f"p90={all_gaps[int(n*0.9)]} ({all_gaps[int(n*0.9)]/fps:.1f}s)  "
+              f"p99={all_gaps[int(n*0.99)]} ({all_gaps[int(n*0.99)]/fps:.1f}s)  "
+              f"max={all_gaps[-1]} ({all_gaps[-1]/fps:.1f}s)")
+        print(f"    MAX_GAP_FRAMES={MAX_GAP_FRAMES} covers "
+              f"{sum(1 for g in all_gaps if g <= MAX_GAP_FRAMES)/n*100:.1f}% of pairs")
 
     candidates = find_merge_candidates(endpoints, color_map)
     print(f"  Merge candidates found: {len(candidates)}")
