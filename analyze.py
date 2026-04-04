@@ -16,6 +16,13 @@ import os
 import sys
 import time
 
+# Load .env file if present (keeps API keys out of shell profiles)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,8 +43,8 @@ Examples:
     )
 
     parser.add_argument("video", help="Path to the game video file")
-    parser.add_argument("--jersey", type=int, required=True,
-                        help="Target player's jersey number (1-99)")
+    parser.add_argument("--jersey", type=int, default=None,
+                        help="Target player's jersey number (1-99). If omitted, an interactive picker opens.")
     parser.add_argument("--model", default=config.YOLO_MODEL,
                         help=f"YOLO model name (default: {config.YOLO_MODEL})")
     parser.add_argument("--device", default=config.DEVICE,
@@ -52,6 +59,10 @@ Examples:
                         help=f"Field width in meters (default: {config.FIELD_WIDTH_METERS})")
     parser.add_argument("--no-llm", action="store_true",
                         help="Skip Claude API analysis (Stage 4)")
+    parser.add_argument("--no-merge", action="store_true",
+                        help="Skip Stage 1b track merging (use when merger produces bad results)")
+    parser.add_argument("--no-pdf", action="store_true",
+                        help="Skip PDF report generation (Stage 5b)")
 
     args = parser.parse_args()
 
@@ -60,7 +71,7 @@ Examples:
         print(f"Error: Video file not found: {args.video}")
         sys.exit(1)
 
-    if not 1 <= args.jersey <= 99:
+    if args.jersey is not None and not 1 <= args.jersey <= 99:
         print(f"Error: Jersey number must be 1-99, got {args.jersey}")
         sys.exit(1)
 
@@ -85,7 +96,7 @@ Examples:
     print("  SOCCER GAME ANALYZER")
     print("=" * 60)
     print(f"  Video:    {args.video}")
-    print(f"  Jersey:   #{args.jersey}")
+    print(f"  Jersey:   {'#' + str(args.jersey) if args.jersey else 'interactive picker'}")
     print(f"  Device:   {args.device}")
     print(f"  Output:   {output_dir}/")
     print(f"  Stage:    {args.stage}")
@@ -109,6 +120,20 @@ Examples:
             sys.exit(1)
         print(f"\n[Stage 1] Skipped (using {detections_path})")
 
+    # --- Stage 1b: Post-Process Track Merging ---
+    # Runs BEFORE Stage 2: extracts jersey colours directly from video pixels so
+    # Stage 2 (OCR + interactive picker) sees ~50 merged tracks, not ~1,500.
+    # Condition: stage <= 2 so it runs when resuming from --stage 2 as well.
+    if args.stage <= 2 and not args.no_merge:
+        from pipeline import reidentify
+        reidentify.run(
+            detections_path=detections_path,
+            player_identity_path=os.path.join(output_dir, "player_identity.json"),
+            output_dir=output_dir,
+        )
+    elif args.no_merge:
+        print("\n[Stage 1b] Skipped (--no-merge)")
+
     # --- Stage 2: Player Identification ---
     if args.stage <= 2:
         from pipeline import identify
@@ -124,17 +149,6 @@ Examples:
             sys.exit(1)
         print(f"\n[Stage 2] Skipped (using {identity_path})")
 
-    # --- Stage 1b: Post-Process Track Merging ---
-    # Runs after Stage 2 (needs color data from player_identity.json) but before Stage 3.
-    # Merges residual fragmented tracks that BoT-SORT didn't catch at tracking time.
-    if args.stage <= 2:
-        from pipeline import reidentify
-        reidentify.run(
-            detections_path=detections_path,
-            player_identity_path=identity_path,
-            output_dir=output_dir,
-        )
-
     # --- Stage 3: Feature Extraction ---
     if args.stage <= 3:
         from pipeline import features
@@ -142,6 +156,7 @@ Examples:
             detections_path=detections_path,
             identity_path=identity_path,
             output_dir=output_dir,
+            video_path=video_path,
         )
         # Stage 3b: Advanced features (spacing, off-ball, positional intelligence)
         from pipeline import advanced_features
@@ -183,6 +198,22 @@ Examples:
         identity_path=identity_path,
         output_dir=output_dir,
     )
+
+    # --- Stage 5b: PDF Report ---
+    if not args.no_pdf:
+        try:
+            from pipeline import pdf_report
+            pdf_report.run(
+                stats_path=stats_path,
+                identity_path=identity_path,
+                analysis_path=analysis_path,
+                detections_path=detections_path,
+                output_dir=output_dir,
+            )
+        except ImportError:
+            print("\n[Stage 5b] Skipped (mplsoccer not installed — pip install mplsoccer)")
+    else:
+        print("\n[Stage 5b] Skipped (--no-pdf)")
 
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)

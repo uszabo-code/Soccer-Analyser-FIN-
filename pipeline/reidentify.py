@@ -20,18 +20,61 @@ from collections import defaultdict
 
 # Max gap in video-frame units to attempt merging.
 # frame_num in detections.json is the raw video frame number (not processed-frame index).
-# 900 = 30s at 30fps — covers set pieces, camera cuts, brief off-screen exits.
-# Previously 90 (3s), which was tuned for low-fragmentation BoT-SORT output.
-# With football_yolov8 + BoT-SORT we still see ~140 fragments/player, so extend to 30s.
-MAX_GAP_FRAMES = 900
+# 150 ≈ 5s at 30fps — covers brief off-screen exits, goal celebrations, close camera cuts.
+# Previously 900 (30s) which caused chain-merges absorbing entire teams into one track.
+MAX_GAP_FRAMES = 150
 
-# Max pixel distance (at max gap). Scales linearly for shorter gaps via allowed_dist formula.
-# At 30s gap: ~1500px allowed. At 3s gap: ~150px. Guards against cross-player false merges.
-MAX_SPATIAL_DISTANCE_PX = 1500
+# Walking speed model for spatial plausibility.
+# 12 px per processed frame ≈ 2.8 m/s at 60m/1920px scale, FRAME_SKIP=2, 25fps.
+# Allows a player to have walked at most this far during the gap.
+# Much stricter than the old fixed MAX_SPATIAL_DISTANCE_PX * 0.3 = 450px floor.
+WALK_SPEED_PX_PER_PROCESSED_FRAME = 12.0
+MIN_ALLOWED_DIST_PX = 50  # Minimum spatial tolerance regardless of gap (jitter buffer)
+
+# Maximum members in a merged group. Prevents runaway union-find chains.
+# A player's track should not be formed from more than this many raw fragments.
+MAX_MERGED_PER_GROUP = 5
+
+# Max direction change (degrees) between exit velocity of track A and entry velocity of track B.
+# Angles above this threshold indicate the two tracks are unlikely to be the same player.
+MAX_DIRECTION_CHANGE_DEG = 90.0
+
+
+def _center(bbox):
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def _velocity(dets_sorted, n=3):
+    """
+    Estimate velocity vector from the first or last n detections.
+    Returns (vx, vy) in pixels per frame, or (0, 0) if insufficient data.
+    """
+    if len(dets_sorted) < 2:
+        return (0.0, 0.0)
+    sample = dets_sorted[:n]
+    if len(sample) < 2:
+        return (0.0, 0.0)
+    c0 = _center(sample[0]["bbox"])
+    c1 = _center(sample[-1]["bbox"])
+    frames = max(sample[-1]["frame_num"] - sample[0]["frame_num"], 1)
+    return ((c1[0] - c0[0]) / frames, (c1[1] - c0[1]) / frames)
+
+
+def _direction_angle_deg(v1, v2):
+    """Angle (degrees) between two velocity vectors. Returns 0–180."""
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    len1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
+    len2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
+    if len1 < 0.01 or len2 < 0.01:
+        return 0.0  # one track is stationary — don't penalise
+    cos_a = max(-1.0, min(1.0, dot / (len1 * len2)))
+    return math.degrees(math.acos(cos_a))
 
 
 def _get_track_endpoints(person_detections):
-    """Return {track_id: {'first_frame', 'last_frame', 'first_pos', 'last_pos', 'detections'}}."""
+    """Return {track_id: {'first_frame', 'last_frame', 'first_pos', 'last_pos',
+                          'exit_vel', 'entry_vel', 'count'}}."""
     tracks = defaultdict(list)
     for det in person_detections:
         tid = det.get("track_id", -1)
@@ -45,15 +88,15 @@ def _get_track_endpoints(person_detections):
         first = dets_sorted[0]
         last = dets_sorted[-1]
 
-        def center(bbox):
-            x1, y1, x2, y2 = bbox
-            return ((x1 + x2) / 2, (y1 + y2) / 2)
-
         endpoints[tid] = {
             "first_frame": first["frame_num"],
             "last_frame": last["frame_num"],
-            "first_pos": center(first["bbox"]),
-            "last_pos": center(last["bbox"]),
+            "first_pos": _center(first["bbox"]),
+            "last_pos": _center(last["bbox"]),
+            # exit velocity: direction the track was moving at its end
+            "exit_vel": _velocity(list(reversed(dets_sorted)), n=3),
+            # entry velocity: direction the track was moving at its start
+            "entry_vel": _velocity(dets_sorted, n=3),
             "count": len(dets_sorted),
         }
     return endpoints, tracks
@@ -78,12 +121,17 @@ def _build_color_map(player_identity_path):
     return color_map
 
 
-def find_merge_candidates(endpoints, color_map):
+def find_merge_candidates(endpoints, color_map, frame_skip: int = 2, fps: float = 30.0):
     """
     Find pairs of tracks to merge.
 
-    Returns list of (track_a, track_b) where track_a ends before track_b starts,
-    they share the same color, and are spatially plausible.
+    Guards against false merges with three checks:
+    1. Same jersey color (coarse filter)
+    2. Temporal non-overlap + gap within MAX_GAP_FRAMES
+    3. Spatial plausibility: distance ≤ walking speed × gap duration
+    4. Trajectory direction consistency: exit→entry angle ≤ MAX_DIRECTION_CHANGE_DEG
+
+    Returns list of (tid_earlier, tid_later, gap_frames, dist_px).
     """
     track_ids = sorted(endpoints.keys())
     candidates = []
@@ -114,14 +162,25 @@ def find_merge_candidates(endpoints, color_map):
             if gap_frames > MAX_GAP_FRAMES:
                 continue  # Too long a gap to reliably merge
 
-            # Check spatial plausibility
-            dist = _euclidean(earlier["last_pos"], later["first_pos"])
-            # Allow more distance proportional to gap length
-            allowed_dist = MAX_SPATIAL_DISTANCE_PX * (gap_frames / MAX_GAP_FRAMES)
-            allowed_dist = max(MAX_SPATIAL_DISTANCE_PX * 0.3, allowed_dist)
+            # Spatial plausibility: walking-speed model
+            # gap_frames is in raw video frames; convert to processed frames
+            gap_processed = max(1, gap_frames // frame_skip)
+            allowed_dist = max(MIN_ALLOWED_DIST_PX,
+                               gap_processed * WALK_SPEED_PX_PER_PROCESSED_FRAME)
 
-            if dist <= allowed_dist:
-                candidates.append((tid_earlier, tid_later, gap_frames, dist))
+            dist = _euclidean(earlier["last_pos"], later["first_pos"])
+            if dist > allowed_dist:
+                continue
+
+            # Trajectory direction consistency check
+            # The exit velocity of the earlier track should roughly align with the
+            # entry velocity of the later track — prevents merging players moving
+            # in opposite directions who happen to share a jersey color.
+            angle = _direction_angle_deg(earlier["exit_vel"], later["entry_vel"])
+            if angle > MAX_DIRECTION_CHANGE_DEG:
+                continue
+
+            candidates.append((tid_earlier, tid_later, gap_frames, dist))
 
     return candidates
 
@@ -162,7 +221,19 @@ def _build_merge_map(candidates, endpoints):
     for tid in all_ids:
         groups[find(tid)].append(tid)
 
-    return {root: sorted(members) for root, members in groups.items() if len(members) > 1}
+    # Cap group size — reject groups that are too large (runaway chain-merges).
+    # A legitimate merge group should cover at most MAX_MERGED_PER_GROUP fragments.
+    filtered = {
+        root: sorted(members)
+        for root, members in groups.items()
+        if 1 < len(members) <= MAX_MERGED_PER_GROUP
+    }
+    rejected = len(groups) - len(filtered)
+    if rejected > 0:
+        print(f"  [reidentify] Rejected {rejected} oversized merge groups "
+              f"(>{MAX_MERGED_PER_GROUP} members) — likely false chain-merges")
+
+    return filtered
 
 
 def apply_merge_map(person_detections, merge_map):
@@ -234,7 +305,10 @@ def run(detections_path: str, player_identity_path: str, output_dir: str):
         print(f"    MAX_GAP_FRAMES={MAX_GAP_FRAMES} covers "
               f"{sum(1 for g in all_gaps if g <= MAX_GAP_FRAMES)/n*100:.1f}% of pairs")
 
-    candidates = find_merge_candidates(endpoints, color_map)
+    frame_skip = det_data.get("frame_skip", 2)
+    fps = det_data.get("fps", 30.0)
+    candidates = find_merge_candidates(endpoints, color_map,
+                                        frame_skip=frame_skip, fps=fps)
     print(f"  Merge candidates found: {len(candidates)}")
 
     merge_map = _build_merge_map(candidates, endpoints)

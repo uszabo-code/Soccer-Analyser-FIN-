@@ -29,7 +29,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import config as base_config
 from research.evaluate import (
     load_detections, ball_detection_score, speed_realism_score,
-    tracking_smoothness_score, combined_score,
+    tracking_smoothness_score, combined_score, fragmentation_score,
 )
 
 # Tunable parameters and their valid ranges
@@ -45,6 +45,11 @@ TUNABLE_PARAMS = {
     "SMOOTHING_WINDOW": {"min": 1, "max": 11, "type": "int", "description": "Position smoothing window size (odd number)"},
     "MIN_MOVEMENT_PX": {"min": 3, "max": 20, "type": "int", "description": "Minimum pixel movement to count as real motion"},
     "DIRECTION_CHANGE_ANGLE": {"min": 60, "max": 150, "type": "int", "description": "Minimum angle for direction change detection"},
+    # BoT-SORT tracker YAML parameters (written to a temporary YAML during experiments)
+    "TRACKER_TRACK_BUFFER": {"min": 60, "max": 300, "type": "int", "description": "BoT-SORT track buffer (frames) — how long a lost track is kept alive"},
+    "TRACKER_MATCH_THRESH": {"min": 0.40, "max": 0.80, "type": "float", "description": "BoT-SORT IoU association threshold — lower = more permissive re-linking"},
+    "TRACKER_NEW_TRACK_THRESH": {"min": 0.15, "max": 0.50, "type": "float", "description": "BoT-SORT minimum confidence to open a new track"},
+    "TRACKER_TRACK_HIGH_THRESH": {"min": 0.15, "max": 0.60, "type": "float", "description": "BoT-SORT high-confidence detection threshold"},
 }
 
 # Map program names to their primary metric function
@@ -52,6 +57,7 @@ METRIC_MAP = {
     "ball_detection": ball_detection_score,
     "speed_calibration": speed_realism_score,
     "tracking_smoothness": tracking_smoothness_score,
+    "reid": fragmentation_score,  # tracker re-identification / fragmentation
 }
 
 
@@ -171,13 +177,64 @@ No explanations — just the JSON object."""
     return validated
 
 
+def _write_tracker_yaml(overrides: dict, base_yaml_path: str, output_path: str):
+    """
+    Write a temporary BoT-SORT YAML with parameter overrides applied.
+
+    Only TRACKER_* keys from overrides are applied. Returns True if any tracker
+    params were found, False if no YAML write was needed.
+    """
+    tracker_keys = {
+        "TRACKER_TRACK_BUFFER": "track_buffer",
+        "TRACKER_MATCH_THRESH": "match_thresh",
+        "TRACKER_NEW_TRACK_THRESH": "new_track_thresh",
+        "TRACKER_TRACK_HIGH_THRESH": "track_high_thresh",
+    }
+    tracker_overrides = {yaml_key: overrides[cfg_key]
+                         for cfg_key, yaml_key in tracker_keys.items()
+                         if cfg_key in overrides}
+    if not tracker_overrides:
+        return False
+
+    # Read base YAML
+    with open(base_yaml_path) as f:
+        lines = f.readlines()
+
+    # Apply overrides line-by-line (simple key: value substitution)
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        replaced = False
+        for yaml_key, new_val in tracker_overrides.items():
+            if stripped.startswith(yaml_key + ":"):
+                new_lines.append(f"{yaml_key}: {new_val}\n")
+                replaced = True
+                break
+        if not replaced:
+            new_lines.append(line)
+
+    with open(output_path, "w") as f:
+        f.writelines(new_lines)
+    return True
+
+
 def run_detection_experiment(
     video_path: str, config_overrides: dict, output_dir: str, timeout: int = 120
 ) -> bool:
     """Run Stage 1 detection with overridden config. Returns True on success."""
+    # Separate config.py overrides from tracker YAML overrides
+    config_only = {k: v for k, v in config_overrides.items()
+                   if not k.startswith("TRACKER_")}
+
     # Write a temporary config override file
     override_path = os.path.join(output_dir, "config_override.json")
-    write_experiment_config(config_overrides, override_path)
+    write_experiment_config(config_only, override_path)
+
+    # Write a temporary tracker YAML if tracker params are overridden
+    base_yaml = os.path.join(PROJECT_ROOT, "botsort_soccer.yaml")
+    exp_yaml = os.path.join(output_dir, "botsort_exp.yaml")
+    has_tracker_overrides = _write_tracker_yaml(config_overrides, base_yaml, exp_yaml)
+    tracker_yaml_line = f"config.TRACKER_CONFIG = '{exp_yaml}'" if has_tracker_overrides else ""
 
     # Build the detection command — we run a minimal detection script
     script = f"""
@@ -191,6 +248,7 @@ overrides = json.load(open('{override_path}'))
 for k, v in overrides.items():
     if hasattr(config, k):
         setattr(config, k, v)
+{tracker_yaml_line}
 
 from pipeline import detect
 detect.run('{video_path}', '{output_dir}')
@@ -249,7 +307,8 @@ def run_experiment_loop(
     print(f"{'='*60}")
 
     # Check if we need to run detection (expensive) or can reuse cached
-    needs_detection = program_name == "ball_detection"
+    # reid needs detection because it tunes tracker parameters
+    needs_detection = program_name in ("ball_detection", "reid")
 
     if needs_detection:
         print("\n[Baseline] Running detection...")

@@ -3,19 +3,26 @@
 # Detection
 # football_yolov8.pt: ball=0, goalkeeper=1, player=2, referee=3 (soccer-specific, 14x more ball dets)
 # yolov8m.pt:         person=0, sports_ball=32 (COCO generic — fallback)
-YOLO_MODEL = "football_yolov8.pt"
+YOLO_MODEL = "football_yolov8.pt"  # best player tracking for this camera setup
 DEVICE = "auto"  # "auto", "mps", "cpu", or "cuda"
 FRAME_SKIP = 2  # Every 2nd frame: 47% fewer tracks, 14% less noise vs FRAME_SKIP=3 at only 1.5x compute
-CONFIDENCE_THRESHOLD = 0.15  # YOLO model conf — set to ball threshold (class filtering below)
+CONFIDENCE_THRESHOLD = 0.15   # Person tracker confidence — keep high to avoid spurious tracks
 PERSON_CONFIDENCE_THRESHOLD = 0.3  # Post-detection filter for persons
-BALL_CONFIDENCE_THRESHOLD = 0.15  # Post-detection filter for ball (small object)
+BALL_CONFIDENCE_THRESHOLD = 0.05  # Ball predict confidence — low to catch faint ball signals
 
 # Class IDs — must match YOLO_MODEL's class mapping
 # football_yolov8.pt: BALL_CLASS_ID=0, PERSON_CLASS_IDS=[1,2,3]
+# soccana_yolo11.pt:  BALL_CLASS_ID=1, PERSON_CLASS_IDS=[0,2]
 # yolov8m.pt (COCO):  BALL_CLASS_ID=32, PERSON_CLASS_IDS=[0]
 BALL_CLASS_ID = 0
-PERSON_CLASS_IDS = [1, 2, 3]  # goalkeeper, player, referee — all tracked as "persons"
-PERSON_CLASS_ID = 2            # Primary player class (for backwards compat)
+PERSON_CLASS_IDS = [1, 2, 3]  # goalkeeper, player, referee
+PERSON_CLASS_ID = 2            # Primary player class
+
+# Ensemble: use COCO yolov8m sports_ball (class 32) as secondary ball detector.
+# COCO has diverse ball types including futsal/indoor balls — different training distribution.
+ENSEMBLE_BALL_MODEL = None           # Disabled — COCO sports_ball adds false positives, not signal
+ENSEMBLE_BALL_CLASS_ID = 32          # sports_ball in COCO (if re-enabled)
+ENSEMBLE_BALL_IOU_THRESHOLD = 0.20
 
 # Overlay filtering — skip detections in these frame regions (stream overlays)
 OVERLAY_TOP_FRACTION = 0.08  # Top 8% of frame
@@ -42,6 +49,14 @@ SPEED_OUTLIER_CAP = 12.0  # m/s — cap unrealistic speeds
 SMOOTHING_WINDOW = 5  # Moving average window for position smoothing (odd number)
 MIN_MOVEMENT_PX = 10  # Minimum pixel displacement to count as real motion
 DIRECTION_CHANGE_ANGLE = 120  # Minimum angle for "sharp" direction change (degrees)
+
+# Ensemble ball detection — set ENSEMBLE_BALL_MODEL to a second model path to enable.
+# When enabled, both models run inference per-frame and ball detections are merged by IoU.
+# Example: ENSEMBLE_BALL_MODEL = "soccana_yolo11.pt" adds the YOLO11 model as a second detector.
+# soccana_yolo11.pt class mapping: Ball=1, Player=0, Referee=2
+ENSEMBLE_BALL_MODEL = None           # Set to model path string to enable (None = disabled)
+ENSEMBLE_BALL_CLASS_ID = 1          # Ball class ID in the ensemble model
+ENSEMBLE_BALL_IOU_THRESHOLD = 0.30  # IoU threshold for deduplication between models
 
 # Claude API
 CLAUDE_MODEL = "claude-sonnet-4-20250514"

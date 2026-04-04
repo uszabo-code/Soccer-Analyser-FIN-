@@ -24,11 +24,44 @@ def load_stats(output_dir: str) -> dict:
         return json.load(f)
 
 
+def load_inplay_windows(csv_path: str) -> list:
+    """
+    Load in-play frame windows from a CSV file.
+
+    CSV format (no header required, or with header start_frame,end_frame):
+        0,750
+        900,1800
+        ...
+
+    Returns list of (start_frame, end_frame) tuples.
+    """
+    import csv
+    windows = []
+    with open(csv_path) as f:
+        reader_csv = csv.reader(f)
+        for row in reader_csv:
+            if not row or row[0].strip().lower() in ("start_frame", "#"):
+                continue  # skip header / comments
+            try:
+                windows.append((int(row[0].strip()), int(row[1].strip())))
+            except (IndexError, ValueError):
+                pass
+    return windows
+
+
+def _is_inplay(frame_num: int, inplay_windows) -> bool:
+    """Return True if frame_num falls within any in-play window (or if no windows defined)."""
+    if not inplay_windows:
+        return True
+    return any(s <= frame_num <= e for s, e in inplay_windows)
+
+
 # ---------------------------------------------------------------------------
 # Metric 1: Ball detection quality
 # ---------------------------------------------------------------------------
 
-def ball_detection_score(detections: dict) -> Tuple[float, dict]:
+def ball_detection_score(detections: dict,
+                          inplay_windows: list = None) -> Tuple[float, dict]:
     """
     Score ball detection quality.
 
@@ -36,6 +69,13 @@ def ball_detection_score(detections: dict) -> Tuple[float, dict]:
     - detection_rate: ball detections per processed frame (0 to 1+)
     - temporal_coverage: fraction of 1-second windows with at least one ball detection
     - consistency: fraction of ball detections that have a neighbor within 5 frames
+
+    Args:
+        detections: loaded detections.json dict
+        inplay_windows: optional list of (start_frame, end_frame) tuples.
+            When provided, only frames within these windows count in the denominator.
+            This prevents dead-ball periods from inflating the total frame count and
+            suppressing the apparent ball detection rate.
 
     Final score = weighted combination, 0-100 scale.
     """
@@ -48,12 +88,23 @@ def ball_detection_score(detections: dict) -> Tuple[float, dict]:
         return 0.0, {"error": "no person detections"}
 
     # Approximate total processed frames from person detections
-    all_frames = set(d["frame_num"] for d in person_dets)
-    all_frames.update(d["frame_num"] for d in ball_dets)
+    # When inplay_windows provided, filter to only in-play frames
+    all_frames_raw = set(d["frame_num"] for d in person_dets)
+    all_frames_raw.update(d["frame_num"] for d in ball_dets)
+
+    if inplay_windows:
+        all_frames = {f for f in all_frames_raw if _is_inplay(f, inplay_windows)}
+        ball_dets_filtered = [d for d in ball_dets if _is_inplay(d["frame_num"], inplay_windows)]
+        inplay_note = f"filtered to {len(all_frames)}/{len(all_frames_raw)} in-play frames"
+    else:
+        all_frames = all_frames_raw
+        ball_dets_filtered = ball_dets
+        inplay_note = "no in-play filter (all frames counted)"
+
     total_processed = len(all_frames) if all_frames else 1
 
     # Detection rate
-    detection_rate = len(ball_dets) / total_processed
+    detection_rate = len(ball_dets_filtered) / total_processed
     # Clamp contribution: rate of 0.5+ is perfect
     rate_score = min(detection_rate / 0.5, 1.0)
 
@@ -67,7 +118,7 @@ def ball_detection_score(detections: dict) -> Tuple[float, dict]:
     if window_frames < 1:
         window_frames = 30
 
-    ball_frames = set(d["frame_num"] for d in ball_dets)
+    ball_frames = set(d["frame_num"] for d in ball_dets_filtered)
     n_windows = max(1, (max_frame - min_frame) // window_frames)
     windows_with_ball = 0
     for w in range(n_windows):
@@ -93,8 +144,10 @@ def ball_detection_score(detections: dict) -> Tuple[float, dict]:
     score = (rate_score * 40 + coverage * 35 + consistency * 25)
 
     return score, {
-        "ball_detections": len(ball_dets),
+        "ball_detections": len(ball_dets_filtered),
+        "ball_detections_total": len(ball_dets),
         "total_processed_frames": total_processed,
+        "inplay_note": inplay_note,
         "detection_rate": round(detection_rate, 4),
         "temporal_coverage": round(coverage, 4),
         "consistency": round(consistency, 4),
@@ -285,14 +338,74 @@ def tracking_smoothness_score(detections: dict, smoothing_window: int = 1,
 
 
 # ---------------------------------------------------------------------------
+# Metric 4: Track fragmentation
+# ---------------------------------------------------------------------------
+
+def fragmentation_score(detections: dict, expected_players: int = 22,
+                         min_det_threshold: int = 10) -> Tuple[float, dict]:
+    """
+    Score track fragmentation quality.
+
+    A perfect score (100) means the number of significant tracks equals the number
+    of expected players — i.e., each player has exactly one track.
+
+    Score = min((expected_players / significant_tracks) * 100, 100)
+
+    Lower fragmentation → higher score.
+
+    Args:
+        detections: loaded detections.json dict
+        expected_players: total players expected on field (default 22 + referees ≈ 24)
+        min_det_threshold: minimum detections for a track to be "significant"
+
+    Returns:
+        (score 0-100, detail dict)
+    """
+    from collections import defaultdict
+    tracks: dict = defaultdict(int)
+    for d in detections.get("person_detections", []):
+        tid = d.get("track_id", -1)
+        if tid >= 0:
+            tracks[tid] += 1
+
+    significant = [tid for tid, cnt in tracks.items() if cnt >= min_det_threshold]
+    n_significant = len(significant)
+
+    if n_significant == 0:
+        return 0.0, {"error": "no significant tracks found"}
+
+    fragments_per_player = n_significant / expected_players
+    # Score: 1.0 fragments/player = 100, 10.0 = 10, etc.
+    score = min((expected_players / n_significant) * 100, 100.0)
+
+    return score, {
+        "significant_tracks": n_significant,
+        "expected_players": expected_players,
+        "fragments_per_player": round(fragments_per_player, 2),
+        "total_tracks": len(tracks),
+        "min_det_threshold": min_det_threshold,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Combined score
 # ---------------------------------------------------------------------------
 
-def combined_score(detections: dict, field_width_m: float = 90.0) -> Tuple[float, dict]:
-    """Run all metrics and return a weighted combined score."""
-    ball_score, ball_detail = ball_detection_score(detections)
+def combined_score(detections: dict, field_width_m: float = 90.0,
+                   inplay_windows: list = None) -> Tuple[float, dict]:
+    """
+    Run all metrics and return a weighted combined score.
+
+    Args:
+        detections: loaded detections.json dict
+        field_width_m: assumed field width in metres for speed calibration
+        inplay_windows: optional list of (start_frame, end_frame) tuples for
+            filtering the ball detection denominator to in-play frames only
+    """
+    ball_score, ball_detail = ball_detection_score(detections, inplay_windows=inplay_windows)
     speed_score, speed_detail = speed_realism_score(detections, field_width_m=field_width_m)
     track_score, track_detail = tracking_smoothness_score(detections)
+    frag_score, frag_detail = fragmentation_score(detections)
 
     combined = ball_score * 0.4 + speed_score * 0.3 + track_score * 0.3
 
@@ -301,6 +414,7 @@ def combined_score(detections: dict, field_width_m: float = 90.0) -> Tuple[float
         "ball_detection": {"score": round(ball_score, 2), **ball_detail},
         "speed_realism": {"score": round(speed_score, 2), **speed_detail},
         "tracking_smoothness": {"score": round(track_score, 2), **track_detail},
+        "fragmentation": {"score": round(frag_score, 2), **frag_detail},
     }
 
 
@@ -314,7 +428,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Evaluate soccer analyzer output")
     parser.add_argument("output_dir", help="Path to output directory with detections.json")
-    parser.add_argument("--field-width", type=float, default=90.0)
+    parser.add_argument("--field-width", type=float, default=90.0,
+                        help="Field width in metres for speed calibration (default: 90)")
+    parser.add_argument("--inplay", metavar="CSV",
+                        help="Path to CSV with start_frame,end_frame in-play windows. "
+                             "When provided, ball detection score only counts in-play frames.")
     args = parser.parse_args()
 
     try:
@@ -323,7 +441,13 @@ if __name__ == "__main__":
         print(f"No detections.json found in {args.output_dir}", file=sys.stderr)
         sys.exit(1)
 
-    score, details = combined_score(dets, field_width_m=args.field_width)
+    inplay = None
+    if args.inplay:
+        inplay = load_inplay_windows(args.inplay)
+        print(f"Loaded {len(inplay)} in-play windows from {args.inplay}")
+
+    score, details = combined_score(dets, field_width_m=args.field_width,
+                                    inplay_windows=inplay)
 
     print(f"\n{'='*50}")
     print(f"  EVALUATION RESULTS")

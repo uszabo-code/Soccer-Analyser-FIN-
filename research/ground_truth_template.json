@@ -1,0 +1,49 @@
+{
+  "_how_to_annotate": [
+    "Annotate every 5th frame (frame 0, 5, 10, 15, ...).",
+    "For each frame, fill in 'ball' and/or 'target_player' bounding boxes.",
+    "bbox format: [x1, y1, x2, y2] pixels — top-left corner to bottom-right corner.",
+    "Set ball.in_play=false for dead-ball stoppages (throw-ins, goal kicks, halftime).",
+    "Omit 'ball' entry entirely if ball is not visible that frame.",
+    "Omit 'target_player' entry entirely if your son is off-screen.",
+    "Delete this _how_to_annotate key before running eval_groundtruth.py.",
+    "Run: python research/eval_groundtruth.py output/eval_baseline/detections.json research/ground_truth.json"
+  ],
+  "clip_info": {
+    "source_video": "research/clips/eval_clip.mp4",
+    "fps": 25.0,
+    "annotated_every_n_frames": 5,
+    "annotated_by": "",
+    "notes": ""
+  },
+  "frames": {
+    "0": {
+      "ball": {
+        "bbox": [960, 540, 978, 558],
+        "in_play": true
+      },
+      "target_player": {
+        "bbox": [420, 310, 480, 430]
+      }
+    },
+    "5": {
+      "ball": {
+        "bbox": [985, 535, 1003, 553],
+        "in_play": true
+      },
+      "target_player": {
+        "bbox": [435, 315, 495, 435]
+      }
+    },
+    "10": {
+      "ball": {
+        "in_play": false
+      }
+    },
+    "15": {
+      "target_player": {
+        "bbox": [460, 325, 520, 445]
+      }
+    }
+  }
+}
