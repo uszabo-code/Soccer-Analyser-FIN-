@@ -28,6 +28,11 @@ tmp_models/
 # Paddle model cache
 .paddlex/
 
+# Eval fixtures — large/generated files not committed
+evals/fixtures/*/clip.mp4
+evals/fixtures/*/identity_raw.json
+
 # Secrets (never commit)
 .env
 *.env
+.gstack/

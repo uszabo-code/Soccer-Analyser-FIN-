@@ -74,9 +74,13 @@ Place `.pt` files in the project root. The ball detection rate drop from eval cl
 
 ### API Key
 
+Create a `.env` file in the project root (never commit this — it is gitignored):
+
 ```bash
-export ANTHROPIC_API_KEY=your_key_here
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env
 ```
+
+The pipeline loads it automatically via `python-dotenv`. Alternatively use a shell export, but the `.env` approach keeps the key out of your shell profile and away from any work/cloud credential setup.
 
 ---
 
@@ -131,14 +135,15 @@ Tuned for overhead fixed-angle cameras:
 
 ```yaml
 tracker_type: botsort
-track_buffer: 90           # 3s gap tolerance — players re-enter after occlusion
-match_thresh: 0.7          # Association similarity threshold
-gmc_method: sparseOptFlow  # Camera motion compensation (GMC)
-with_reid: False           # ReID disabled — OSNet trained on close-up pedestrians,
-                           # performs poorly on overhead 80–150px player crops
+track_buffer: 90    # 3s gap tolerance — players re-enter after occlusion
+match_thresh: 0.7   # Association similarity threshold
+gmc_method: none    # GMC disabled — see note below
+with_reid: False    # ReID disabled — see note below
 ```
 
-> **Why no ReID?** We tested BoT-SORT with `with_reid=True` and `appearance_thresh=0.25`. Track count tripled and median track length dropped to 3 frames — the OSNet appearance model made wrong decisions on overhead soccer players (out-of-distribution from its pedestrian training data) and fragmented tracks instead of merging them. GMC-only BoT-SORT gives 5 perfectly continuous tracks out of 5 on a 300-frame clip.
+> **Why no ReID?** We tested BoT-SORT with `with_reid=True` and `appearance_thresh=0.25`. Track count tripled and median track length dropped to 3 frames — the OSNet appearance model made wrong decisions on overhead soccer players (out-of-distribution from its pedestrian training data) and fragmented tracks instead of merging them.
+
+> **Why no GMC?** BoT-SORT's `sparseOptFlow` GMC is designed for moving cameras. On a fixed overhead Veo camera it finds near-zero global motion, which corrupts Kalman filter predictions and causes 2 track IDs to "absorb" the whole game (~18,000 frames each) while everything else fragments into noise. Always set `gmc_method: none` for fixed-angle cameras.
 
 ---
 
@@ -151,18 +156,18 @@ with_reid: False           # ReID disabled — OSNet trained on close-up pedestr
 | YOLOv8m COCO + ByteTrack + SKIP=3 | 0% | 262 | 63% | 0 |
 | `football_yolov8.pt` + BoT-SORT + SKIP=2 | **30%** | **39** | **38%** | **5 / 5** |
 
-### Full game results (90-minute match, FRAME_SKIP=2)
+### Full game results (20-minute match, FRAME_SKIP=2, v5 config)
 
 | Metric | Value |
 |---|---|
 | Processed frames | 18,359 |
 | Person detections | 294,509 |
 | Ball detections | 1,029 (5.6%) |
-| Total tracks | 8,350 |
-| Significant tracks (>10 detections) | 3,115 |
-| Longest single track | 1,197 frames |
+| Total tracks | 7,798 |
+| Significant tracks (≥45 detections) | 1,540 |
+| Longest single track | ~1,200 frames |
 
-Track fragmentation across a full game is the main open challenge (see Known Limitations). Stage 1b post-process merging reduces this significantly.
+Track fragmentation across a full game is the main open challenge (see Known Limitations). With ~22 players expected, 1,540 significant tracks means ~70 fragments per player on average. Stage 1b post-process merging is intended to address this but has a known critical bug (see Known Limitations).
 
 ### FRAME_SKIP impact (300-frame test)
 
@@ -233,30 +238,55 @@ Veo Analytics is the standard tool in Finnish youth clubs and a direct reference
 
 ## Known Limitations
 
-**Track fragmentation:** A full 90-minute game produces ~3,100 significant tracks for ~22 players. Stage 1b merges many of these, but fragmentation remains the main accuracy bottleneck. Root cause: YOLOv8 detection drops below threshold when players overlap or cluster, causing the tracker to open new IDs on re-detection. Being addressed via Stage 1b tuning and autoresearch.
+### 🔴 Critical — blocks end-to-end analysis
 
-**Speed calibration:** `FIELD_WIDTH_METERS` assumes the full frame width shows exactly 60m of field. If the camera is zoomed differently, computed speeds will be wrong. A proper homography calibration tool (user marks 4 field landmarks → saves a per-venue transform matrix) is on the roadmap.
+**Speed and distance calibration is wrong.** Current output shows total distances of 97–591 km for a 20-minute game. Root cause: `FIELD_WIDTH_METERS` is used for a simple linear pixel→metre conversion assuming the full frame width maps to exactly 60m. In practice, Veo cameras crop and zoom differently per venue, making this assumption invalid. A homography calibration step (user marks 4 known field landmarks → computes a per-venue transform matrix) is required before any physical stats are meaningful.
 
-**PaddleOCR on macOS MPS:** PaddleOCR can segfault during Stage 2 on Apple Silicon when running on MPS. If this happens, force CPU for OCR by setting `use_gpu=False` in `utils/ocr.py`. OCR is CPU-bound anyway with no performance penalty.
+**Target player track is dropped by Stage 3.** When the user selects a player via the interactive picker, the selected track ID typically has too few detections to meet Stage 3's minimum threshold. The player is identified correctly in Stage 2 but silently skipped in Stage 3. Root cause: the selected player is fragmented across many small tracks; Stage 1b must successfully merge those fragments before Stage 3 runs.
 
-**Ball detection on full games:** Ball detection rate drops from ~30% on short clips to ~5.6% on full games. Many frames have no visible ball (out of play, halftime, wide shots). Ball proximity and involvement stats should be interpreted with this in mind.
+**Stage 1b (track merger) has a critical bug.** The Union-Find merger currently chain-merges far too aggressively, absorbing entire teams into single mega-tracks. This was caught in v4 testing and Stage 1b is currently disabled with `--no-merge`. Fixing the merger's spatial/temporal constraints is required before end-to-end analysis works.
+
+### 🟡 Significant — degrades output quality
+
+**Track fragmentation.** A 20-minute game produces ~1,540 significant tracks for ~22 players (~70 fragments per player). Root cause: YOLOv8 detection confidence drops during player clustering and occlusions, causing the tracker to open new IDs on re-detection. Fragmentation directly blocks target player analysis (see above).
+
+**Jersey OCR unreliable on overhead footage.** PaddleOCR and EasyOCR were trained on document/close-up text. Overhead soccer footage gives tiny (~80–150px) players with jerseys at oblique angles — jersey numbers are often not visible at all. OCR is the current primary identification method but may need to be replaced or supplemented with appearance-based re-identification or manual selection only.
+
+**Ball detection drops to 5.6% on full games.** Detection rate drops from ~30% on short clips to 5.6% on full games. Many frames have no visible ball (out of play, halftime, wide shots). Ball proximity and involvement stats should be interpreted with this in mind.
+
+### 🟢 Minor — workarounds available
+
+**PaddleOCR on macOS MPS.** PaddleOCR v3.x can segfault on Apple Silicon MPS. Force CPU (`device="cpu"` in `utils/ocr.py`) — OCR is CPU-bound with no real performance penalty.
+
+**ANTHROPIC_API_KEY must be in environment.** The pipeline does not auto-load `.env` unless `python-dotenv` is installed and explicitly called. If Stage 4 is skipped with "Set ANTHROPIC_API_KEY", verify the key is exported in the shell running the pipeline.
 
 ---
 
 ## Roadmap
 
-- [x] Football-specific YOLOv8 detection model (vs generic COCO)
-- [x] BoT-SORT with GMC, ReID disabled (47% fewer tracks, perfect continuity on eval)
-- [x] FRAME_SKIP=2 tuning
-- [x] Post-process track merger — Stage 1b (Union-Find, spatial + temporal + semantic constraints)
+### Done
+- [x] Football-specific YOLOv8 detection model (vs generic COCO weights)
+- [x] BoT-SORT with ReID disabled (47% fewer tracks, perfect continuity on 300-frame eval)
+- [x] GMC disabled for fixed-angle cameras (prevents mega-track absorption bug)
+- [x] FRAME_SKIP=2 (47% track reduction, first perfect-continuity track on eval)
+- [x] Post-process track merger — Stage 1b skeleton (Union-Find, spatial + temporal + semantic)
+- [x] Interactive click-to-identify player selection (Stage 2 fallback when OCR fails)
 - [x] Advanced features: purposefulness, spacing, positional discipline, work rate phases
 - [x] Claude LLM coaching report (3 focused API calls)
 - [x] Autoresearch framework (Claude-driven parameter optimisation)
-- [ ] `soccana_yolo11.pt` integration (40% ball detection on eval)
-- [ ] Homography calibration tool (per-venue pixel → metres mapping)
-- [ ] Click-to-identify player selection (more reliable than OCR for target player)
-- [ ] HTML report (printable, self-contained, embeds charts)
-- [ ] BoT-SORT parameter autoresearch (track_buffer, match_thresh tuning)
+
+### Critical path — required before end-to-end analysis works
+- [ ] **Fix Stage 1b track merger** — chain-merge bug absorbs entire teams; needs constrained Union-Find with proper gap/distance thresholds
+- [ ] **Homography calibration tool** — per-venue pixel→metre mapping; current linear approximation produces 97–591km distances on a 20-min game
+- [ ] **Stage 3 minimum threshold** — target player track silently dropped if below detection count minimum; fix or lower threshold post-merge
+
+### High priority
+- [ ] **Player identification rethink** — OCR unreliable on overhead footage (jersey rarely visible); evaluate: appearance clustering, manual one-time selection per game, colour + position heuristics
+- [ ] `soccana_yolo11.pt` integration (40% ball detection on eval vs 5.6% on full game)
+- [ ] BoT-SORT parameter autoresearch (track_buffer, match_thresh, new_track_thresh tuning on real game footage)
+
+### Nice to have
+- [ ] HTML report (printable, self-contained, embeds charts and heatmap)
 - [ ] Multi-player mode — full team report in one pass
 - [ ] Season aggregation (SQLite — track player development across games)
 - [ ] Shot map and pass string visualisations (Veo Analytics parity)

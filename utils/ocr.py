@@ -15,7 +15,13 @@ def _init_paddleocr():
         from paddleocr import PaddleOCR
         import logging
         logging.getLogger("ppocr").setLevel(logging.WARNING)
-        engine = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False)
+        engine = PaddleOCR(
+            text_detection_model_name="PP-OCRv4_mobile_det",
+            text_recognition_model_name="en_PP-OCRv4_mobile_rec",
+            use_textline_orientation=False,
+            lang="en",
+            device="cpu",
+        )
 
         # Detect API version: v5 uses predict(), older uses ocr()
         api_version = "v5" if hasattr(engine, 'predict') else "legacy"
