@@ -60,6 +60,9 @@ def run(stats_path: str, identity_path: str, output_dir: str) -> str:
         replacements={"player_data": json.dumps(target_stats, indent=2)},
     )
 
+    # Wait for per-minute token window to reset before next call
+    time.sleep(65)
+
     # --- Call 2: Improvement Suggestions ---
     print("  Generating improvement suggestions...")
     key_moments_data = target_stats.get("key_moments", [])
@@ -71,6 +74,9 @@ def run(stats_path: str, identity_path: str, output_dir: str) -> str:
             "key_moments": json.dumps(key_moments_data, indent=2),
         },
     )
+
+    # Wait for per-minute token window to reset before next call
+    time.sleep(65)
 
     # --- Call 3: Team Strategy ---
     print("  Generating team strategy observations...")
@@ -112,7 +118,7 @@ def run(stats_path: str, identity_path: str, output_dir: str) -> str:
 
 
 def _call_claude(client, prompt_template_path: str, replacements: dict,
-                 max_retries: int = 3) -> dict:
+                 max_retries: int = 5) -> dict:
     """Call Claude API with a prompt template and parse JSON response."""
     with open(prompt_template_path) as f:
         prompt = f.read()
@@ -144,8 +150,11 @@ def _call_claude(client, prompt_template_path: str, replacements: dict,
             # If JSON parsing fails, return raw text in a wrapper
             return {"raw_text": text, "parse_error": True}
         except Exception as e:
+            is_rate_limit = "429" in str(e) or "rate_limit" in str(e)
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
+                # Rate-limit errors need ~60s for the per-minute token window to reset.
+                # Short exponential backoff is fine for transient network errors.
+                wait = 65 if is_rate_limit else 2 ** attempt
                 print(f"    API error: {e}. Retrying in {wait}s...")
                 time.sleep(wait)
             else:

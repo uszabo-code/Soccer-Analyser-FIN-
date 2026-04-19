@@ -5,6 +5,7 @@ import math
 import os
 from collections import defaultdict
 
+import cv2
 import numpy as np
 from tqdm import tqdm
 
@@ -13,9 +14,79 @@ from models.data import Detection, PlayerStats, TimeRange, KeyMoment
 from utils.video import frame_to_timestamp, frame_to_seconds
 
 
-def run(detections_path: str, identity_path: str, output_dir: str) -> str:
+# Minimum confidence to trust HSV field detection (fraction of frames that found green)
+_HSV_CONFIDENCE_THRESHOLD = 0.4
+
+# Gap between consecutive detections (in frames) that marks a new tracking fragment.
+# Matches Stage 1b's MAX_GAP_FRAMES — any gap wider than this means the player
+# was off-camera or undetected, so no distance should be accumulated across it.
+FRAGMENT_GAP_FRAMES = 450
+
+
+def auto_detect_field_width(video_path: str, fps: float, check_frames: int = 10) -> tuple:
+    """
+    Estimate field width in pixels by detecting the green pitch in early frames.
+
+    Segments the pitch using HSV colour thresholding, finds the horizontal extent
+    of the largest green region, and averages across multiple frames.
+
+    Returns (field_width_px, confidence) where confidence is the fraction of
+    sampled frames that contained a detectable green region (0.0–1.0).
+    Returns (None, 0.0) if the video cannot be opened or no green is found.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, 0.0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_count = min(check_frames, total_frames)
+
+    widths = []
+    for i in range(sample_count):
+        frame_pos = int(i * total_frames / sample_count)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Natural grass green: H 35–85, S ≥40, V ≥40
+        lower_green = np.array([35, 40, 40])
+        upper_green = np.array([85, 255, 255])
+        mask = cv2.inRange(hsv, lower_green, upper_green)
+
+        # Find horizontal extent of the green region
+        cols_with_green = np.any(mask > 0, axis=0)
+        if cols_with_green.sum() > 0:
+            leftmost = int(np.argmax(cols_with_green))
+            rightmost = int(len(cols_with_green) - np.argmax(cols_with_green[::-1]) - 1)
+            width_px = rightmost - leftmost
+            # Only count if green spans at least 30% of the frame width
+            if width_px > frame.shape[1] * 0.3:
+                widths.append(width_px)
+
+    cap.release()
+
+    if not widths:
+        return None, 0.0
+
+    confidence = len(widths) / sample_count
+    return float(np.mean(widths)), confidence
+
+
+def run(detections_path: str, identity_path: str, output_dir: str,
+        video_path=None) -> str:
     """
     Extract player statistics and key moments.
+
+    Args:
+        detections_path: Path to detections.json from Stage 1/1b.
+        identity_path:   Path to player_identity.json from Stage 2.
+        output_dir:      Directory to write player_stats.json.
+        video_path:      Optional path to the original video. When provided,
+                         auto_detect_field_width() is used for a more accurate
+                         pixel-to-metre conversion. Falls back to FIELD_WIDTH_METERS.
 
     Returns path to the output player stats JSON file.
     """
@@ -40,10 +111,26 @@ def run(detections_path: str, identity_path: str, output_dir: str) -> str:
         for tid in p["track_ids"]:
             players_by_id[tid] = p
 
-    # Pixel-to-meter conversion (approximate)
-    # Assume the full frame width corresponds to the configured field width
-    px_per_meter = frame_width / config.FIELD_WIDTH_METERS
-    time_per_frame = frame_skip / fps if fps > 0 else 0.033  # seconds between processed frames
+    # ── Pixel-to-metre conversion ──────────────────────────────────────────────
+    # Try HSV auto-detection first; fall back to config value.
+    calibration_confidence = 0.0
+    if video_path:
+        detected_width_px, calibration_confidence = auto_detect_field_width(video_path, fps)
+        if detected_width_px and calibration_confidence >= _HSV_CONFIDENCE_THRESHOLD:
+            px_per_meter = detected_width_px / config.FIELD_WIDTH_METERS
+            print(f"  Field width auto-detected: {detected_width_px:.0f}px "
+                  f"(confidence {calibration_confidence:.0%}) → "
+                  f"{px_per_meter:.1f} px/m")
+        else:
+            px_per_meter = frame_width / config.FIELD_WIDTH_METERS
+            print(f"  Field width: using config ({config.FIELD_WIDTH_METERS}m) — "
+                  f"auto-detection confidence too low ({calibration_confidence:.0%}). "
+                  f"Speed/distance estimates may be inaccurate. "
+                  f"Override with --field-width.")
+    else:
+        px_per_meter = frame_width / config.FIELD_WIDTH_METERS
+
+    time_per_frame = frame_skip / fps if fps > 0 else 0.033
 
     # Group detections by track
     tracks = defaultdict(list)
@@ -60,28 +147,77 @@ def run(detections_path: str, identity_path: str, output_dir: str) -> str:
     for bd in ball_dets:
         ball_by_frame[bd.frame_num] = bd.center
 
-    # Determine which tracks to analyze in detail
-    # Always analyze the target player, plus teammates and opponents for context
-    analyze_track_ids = set()
-    for p in id_data["players"]:
-        # Include all tracks with enough detections
-        for tid in p["track_ids"]:
-            if len(tracks.get(tid, [])) > 50:
-                analyze_track_ids.add(tid)
-    # Always include target
-    analyze_track_ids.update(target_track_ids)
+    # Determine which tracks to analyse
+    # Threshold: other players need ≥50 detections; target handled separately below
+    MIN_DETS_OTHER = 50
+    MIN_DETS_ABSOLUTE = 10   # Hard floor — below this stats are meaningless
 
-    print(f"  Analyzing {len(analyze_track_ids)} significant tracks")
+    non_target_analyze_ids = set()
+    for p in id_data["players"]:
+        for tid in p["track_ids"]:
+            if tid not in target_track_ids and len(tracks.get(tid, [])) >= MIN_DETS_OTHER:
+                non_target_analyze_ids.add(tid)
+
+    # --- Target player: combine ALL fragments into one stat entry ---
+    # Player #15 may have many short track fragments across the game (tracker
+    # loses and re-acquires them). Instead of one stat per fragment (which would
+    # show only ~26s), we concatenate all fragments and compute stats across the
+    # full game span, skipping distance at fragment boundaries to avoid
+    # teleportation artifacts.
+    combined_target_dets = []
+    for tid in target_track_ids:
+        combined_target_dets.extend(tracks.get(tid, []))
+    combined_target_dets.sort(key=lambda d: d.frame_num)
+
+    # Deduplicate: keep only the first detection per frame.
+    # Safety net against overlapping tracks (e.g. sweep added tracks that are
+    # simultaneously active with confirmed target tracks). Without this, multiple
+    # detections at the same frame_num create zero-span micro-fragments, making
+    # time_visible ≈ 0 and total_distance ≈ 0.
+    seen_frames: dict = {}
+    for d in combined_target_dets:
+        if d.frame_num not in seen_frames:
+            seen_frames[d.frame_num] = d
+    combined_target_dets = sorted(seen_frames.values(), key=lambda d: d.frame_num)
 
     all_stats = []
 
-    for track_id in tqdm(analyze_track_ids, desc="Features", unit="player"):
+    if combined_target_dets:
+        target_jersey = id_data.get("target_jersey")
+        target_player_info = {
+            "team": id_data.get("target_team", "unknown"),
+            "jersey_number": target_jersey,
+            "display_name": f"#{target_jersey}" if target_jersey else "Selected Player",
+        }
+        n_frags = len(target_track_ids)
+        print(f"  Target: combining {n_frags} fragment(s) "
+              f"({len(combined_target_dets)} total detections)")
+        target_stats = _compute_player_stats(
+            track_id="target_player",
+            dets=combined_target_dets,
+            player_info=target_player_info,
+            ball_by_frame=ball_by_frame,
+            px_per_meter=px_per_meter,
+            time_per_frame=time_per_frame,
+            fps=fps,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            is_target=True,
+            fragment_gap_frames=FRAGMENT_GAP_FRAMES,
+        )
+        all_stats.append(target_stats.to_dict())
+    else:
+        print(f"  ⚠️  WARNING: No detections found for target player tracks {target_track_ids}")
+
+    print(f"  Analysing {len(non_target_analyze_ids)} other player tracks...")
+
+    for track_id in tqdm(non_target_analyze_ids, desc="Features", unit="player"):
         dets = tracks.get(track_id, [])
-        if len(dets) < 10:
+
+        if len(dets) < MIN_DETS_ABSOLUTE:
             continue
 
         player_info = players_by_id.get(track_id, {})
-        is_target = track_id in target_track_ids
 
         stats = _compute_player_stats(
             track_id=track_id,
@@ -93,7 +229,7 @@ def run(detections_path: str, identity_path: str, output_dir: str) -> str:
             fps=fps,
             frame_width=frame_width,
             frame_height=frame_height,
-            is_target=is_target,
+            is_target=False,
         )
         all_stats.append(stats.to_dict())
 
@@ -117,6 +253,44 @@ def run(detections_path: str, identity_path: str, output_dir: str) -> str:
     return output_path
 
 
+def _smooth_positions_fragment_aware(dets: list, centers: list,
+                                     fragment_gap_frames, window: int) -> list:
+    """
+    Apply position smoothing only WITHIN fragment boundaries, never across them.
+
+    Without this guard, a standard moving-average window near a fragment boundary
+    blends positions from two different fragments — e.g. a player at x=100 and
+    x=900 get averaged to x=500, creating artificial distance in the smoothed path.
+    """
+    if window <= 1 or len(centers) < 2:
+        return centers
+
+    # Identify fragment start indices (boundary = track_id change or large gap)
+    frag_starts = [0]
+    for i in range(1, len(dets)):
+        gap = dets[i].frame_num - dets[i - 1].frame_num
+        tid_changed = (
+            hasattr(dets[i], "track_id") and
+            hasattr(dets[i - 1], "track_id") and
+            dets[i].track_id != dets[i - 1].track_id
+        )
+        if tid_changed or (fragment_gap_frames is not None and gap > fragment_gap_frames):
+            frag_starts.append(i)
+
+    if len(frag_starts) == 1:
+        # Single contiguous fragment — standard smoothing
+        return _smooth_positions(centers, window)
+
+    # Multi-fragment: smooth each fragment independently
+    result = list(centers)  # copy
+    frag_ends = frag_starts[1:] + [len(centers)]
+    for start, end in zip(frag_starts, frag_ends):
+        frag_centers = centers[start:end]
+        smoothed = _smooth_positions(frag_centers, window)
+        result[start:end] = smoothed
+    return result
+
+
 def _smooth_positions(centers: list, window: int) -> list:
     """Apply moving average smoothing to center positions."""
     if window <= 1 or len(centers) < window:
@@ -137,22 +311,58 @@ def _smooth_positions(centers: list, window: int) -> list:
 def _compute_player_stats(
     track_id, dets, player_info, ball_by_frame,
     px_per_meter, time_per_frame, fps,
-    frame_width, frame_height, is_target
+    frame_width, frame_height, is_target,
+    fragment_gap_frames=None,
 ) -> PlayerStats:
-    """Compute comprehensive stats for a single player track."""
+    """
+    Compute comprehensive stats for a player track (or combined multi-fragment track).
+
+    fragment_gap_frames: when set, any consecutive pair of detections separated
+    by more than this many frames is treated as a fragment boundary — no distance
+    is accumulated across the gap (avoids teleportation distance for multi-fragment
+    target players whose tracks span the full game with off-camera gaps).
+    """
 
     # Centers and frame numbers
     raw_centers = [d.center for d in dets]
     frames = [d.frame_num for d in dets]
 
-    # Apply position smoothing to reduce tracking jitter
-    centers = _smooth_positions(raw_centers, config.SMOOTHING_WINDOW)
+    # Apply position smoothing to reduce tracking jitter.
+    # For multi-fragment (combined target) data, use fragment-aware smoothing so
+    # the moving average never blends positions from different fragments.
+    if fragment_gap_frames is not None:
+        centers = _smooth_positions_fragment_aware(
+            dets, raw_centers, fragment_gap_frames, config.SMOOTHING_WINDOW
+        )
+    else:
+        centers = _smooth_positions(raw_centers, config.SMOOTHING_WINDOW)
 
     # --- Distance and Speed ---
     distances = []  # pixel distances between consecutive detections
     speeds = []  # m/s
 
     for i in range(1, len(centers)):
+        frame_diff = frames[i] - frames[i - 1]
+
+        # Skip distance/speed calculation across fragment boundaries.
+        # A boundary occurs when:
+        #   (a) The frame gap is larger than the threshold (player off-camera), OR
+        #   (b) The track_id changes (different canonical tracks = defined fragment
+        #       boundary, regardless of gap size)
+        # Without this, the "teleportation" jump between fragment endpoints inflates
+        # distance and speed with physically impossible values.
+        is_fragment_boundary = False
+        if fragment_gap_frames is not None:
+            if frame_diff > fragment_gap_frames:
+                is_fragment_boundary = True
+            elif hasattr(dets[i], "track_id") and hasattr(dets[i - 1], "track_id"):
+                if dets[i].track_id != dets[i - 1].track_id:
+                    is_fragment_boundary = True
+        if is_fragment_boundary:
+            distances.append(0)
+            speeds.append(0)
+            continue
+
         dx = centers[i][0] - centers[i - 1][0]
         dy = centers[i][1] - centers[i - 1][1]
         dist_px = math.sqrt(dx * dx + dy * dy)
@@ -166,7 +376,6 @@ def _compute_player_stats(
         distances.append(dist_px)
 
         # Time between these detections
-        frame_diff = frames[i] - frames[i - 1]
         dt = frame_diff / fps if fps > 0 else time_per_frame
         if dt > 0:
             speed_px = dist_px / dt
@@ -352,7 +561,31 @@ def _compute_player_stats(
     team = player_info.get("team", "unknown")
     jersey_num = player_info.get("jersey_number")
 
-    total_time_s = (frames[-1] - frames[0]) / fps if fps > 0 and len(frames) > 1 else 0
+    # Fragment-aware time visible: sum of each fragment's span.
+    # For a single continuous track this equals (last - first) / fps.
+    # For multi-fragment (combined target) it sums only the visible windows,
+    # correctly excluding off-camera gaps between fragments.
+    if fragment_gap_frames is not None and len(frames) > 1:
+        frag_time_s = 0.0
+        frag_start = frames[0]
+        prev_frame = frames[0]
+        for idx in range(1, len(frames)):
+            fn = frames[idx]
+            # Fragment boundary: large frame gap OR track_id change
+            gap = fn - prev_frame
+            tid_changed = (
+                hasattr(dets[idx], "track_id") and
+                hasattr(dets[idx - 1], "track_id") and
+                dets[idx].track_id != dets[idx - 1].track_id
+            )
+            if gap > fragment_gap_frames or tid_changed:
+                frag_time_s += (prev_frame - frag_start) / fps
+                frag_start = fn
+            prev_frame = fn
+        frag_time_s += (prev_frame - frag_start) / fps
+        total_time_s = frag_time_s
+    else:
+        total_time_s = (frames[-1] - frames[0]) / fps if fps > 0 and len(frames) > 1 else 0
 
     return PlayerStats(
         player_id=display_name,
