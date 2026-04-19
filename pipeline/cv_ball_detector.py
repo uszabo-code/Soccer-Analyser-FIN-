@@ -135,6 +135,36 @@ class CVBallGate:
         return self.cx is not None
 
 
+def find_nearest_to_feet(
+    circles: List[Tuple[float, float, float]],
+    person_bboxes: List[Tuple[float, float, float, float]],
+    max_dist: float = 80.0,
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Find the Hough circle closest to any player's feet (bottom-center of bbox).
+    Returns (cx, cy, r) or None.
+    """
+    if not circles or not person_bboxes:
+        return None
+
+    # Compute foot positions: bottom-center of each person bbox
+    feet = []
+    for x1, y1, x2, y2 in person_bboxes:
+        feet.append(((x1 + x2) / 2, y2))  # bottom center
+
+    best_circle = None
+    best_dist = max_dist
+
+    for cx, cy, r in circles:
+        for fx, fy in feet:
+            dist = math.sqrt((cx - fx) ** 2 + (cy - fy) ** 2)
+            if dist < best_dist:
+                best_dist = dist
+                best_circle = (cx, cy, r)
+
+    return best_circle
+
+
 def filter_static_ball_detections(
     detections: List[Dict],
     min_move_px: float = STATIC_MIN_MOVE_PX,

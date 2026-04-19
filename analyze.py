@@ -47,6 +47,12 @@ Examples:
                         help="Target player's jersey number (1-99). If omitted, an interactive picker opens.")
     parser.add_argument("--model", default=config.YOLO_MODEL,
                         help=f"YOLO model name (default: {config.YOLO_MODEL})")
+    parser.add_argument("--ball-model", default=None,
+                        help="Path to ball-specific model (e.g. futsal_ball_v1.pt). "
+                             "Only used for ball prediction; person tracking still "
+                             "uses --model. Overrides config.BALL_MODEL.")
+    parser.add_argument("--ball-model-class-id", type=int, default=None,
+                        help="Ball class ID within --ball-model (default: 0 for nc=1 fine-tunes)")
     parser.add_argument("--device", default=config.DEVICE,
                         help=f"Compute device: auto, mps, cpu (default: {config.DEVICE})")
     parser.add_argument("--skip", type=int, default=config.FRAME_SKIP,
@@ -80,6 +86,13 @@ Examples:
     config.DEVICE = args.device
     config.FRAME_SKIP = args.skip
     config.FIELD_WIDTH_METERS = args.field_width
+    if args.ball_model is not None:
+        if not os.path.isfile(args.ball_model):
+            print(f"Error: --ball-model file not found: {args.ball_model}")
+            sys.exit(1)
+        config.BALL_MODEL = args.ball_model
+    if args.ball_model_class_id is not None:
+        config.BALL_MODEL_CLASS_ID = args.ball_model_class_id
 
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)

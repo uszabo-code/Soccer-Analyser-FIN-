@@ -18,6 +18,15 @@ BALL_CLASS_ID = 0
 PERSON_CLASS_IDS = [1, 2, 3]  # goalkeeper, player, referee
 PERSON_CLASS_ID = 2            # Primary player class
 
+# Ball-specific model override.
+# When BALL_MODEL is set, only the ball-prediction YOLO instance uses it;
+# person tracking always uses YOLO_MODEL. This allows swapping in a fine-tuned
+# ball detector (e.g. futsal_ball_v1.pt with nc=1) without affecting persons.
+# BALL_MODEL_CLASS_ID is the ball class index within BALL_MODEL's namespace.
+# When BALL_MODEL is None, BALL_CLASS_ID is used for both models.
+BALL_MODEL = None              # Path to ball-specific model weights; None = use YOLO_MODEL
+BALL_MODEL_CLASS_ID = 0        # Ball class ID within BALL_MODEL
+
 # Ensemble: use COCO yolov8m sports_ball (class 32) as secondary ball detector.
 # COCO has diverse ball types including futsal/indoor balls — different training distribution.
 ENSEMBLE_BALL_MODEL = None           # Disabled — COCO sports_ball adds false positives, not signal

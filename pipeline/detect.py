@@ -9,7 +9,10 @@ from tqdm import tqdm
 import config
 from models.data import Detection
 from utils.video import VideoReader
-from pipeline.cv_ball_detector import CVBallGate, detect_hough_candidates, filter_static_ball_detections
+from pipeline.cv_ball_detector import (
+    CVBallGate, detect_hough_candidates, filter_static_ball_detections,
+    find_nearest_to_feet,
+)
 
 
 def _interpolate_track_gaps(person_detections: list, max_gap: int = 3) -> list:
@@ -78,7 +81,8 @@ def get_device():
 
 
 def run(video_path: str, output_dir: str, model_name: str = None,
-        device: str = None, frame_skip: int = None) -> str:
+        device: str = None, frame_skip: int = None,
+        start_frame: int = 0, end_frame: int = None) -> str:
     """
     Run detection and tracking on a video.
 
@@ -106,8 +110,31 @@ def run(video_path: str, output_dir: str, model_name: str = None,
     print(f"  Device: {device}")
     print(f"  Frame skip: {frame_skip}")
 
-    # Load model
+    # Load model for person tracking
     model = YOLO(model_name)
+
+    # Separate model instance for ball prediction.
+    # CRITICAL: model.predict() and model.track() share model.predictor.
+    # Calling predict() on the tracking model replaces the TrackingPredictor
+    # with a plain Predictor, wiping the BoT-SORT persistent state.
+    # Using a separate YOLO instance avoids this.
+    #
+    # If config.BALL_MODEL is set, use that for ball prediction only.
+    # Person tracking still uses model_name. This lets us swap in a fine-tuned
+    # ball detector (e.g. futsal_ball_v1.pt with nc=1) without affecting persons.
+    ball_model_path = getattr(config, 'BALL_MODEL', None) or model_name
+    ball_class_id = getattr(config, 'BALL_MODEL_CLASS_ID', config.BALL_CLASS_ID) \
+        if getattr(config, 'BALL_MODEL', None) else config.BALL_CLASS_ID
+    if ball_model_path != model_name:
+        print(f"  Ball model: {ball_model_path} (class={ball_class_id})")
+    ball_model = YOLO(ball_model_path)
+    # Validate ball class id against the ball model's namespace
+    ball_model_names = ball_model.names
+    if ball_class_id not in ball_model_names:
+        print(f"  ⚠️  WARNING: ball class id {ball_class_id} not in ball_model.names "
+              f"({ball_model_names}) — ball detections will be empty")
+    else:
+        print(f"  ✓ Ball model class {ball_class_id} → '{ball_model_names[ball_class_id]}'")
 
     # Validate class ID mapping — catch mismatch between config and loaded model early
     model_names = model.names  # {class_id: class_name}
@@ -120,7 +147,11 @@ def run(video_path: str, output_dir: str, model_name: str = None,
         print(f"  ✓ Ball class ID {config.BALL_CLASS_ID} → '{ball_class_name}'")
 
     # Open video
-    reader = VideoReader(video_path, frame_skip=frame_skip)
+    reader = VideoReader(video_path, frame_skip=frame_skip,
+                         start_frame=start_frame, end_frame=end_frame)
+    if start_frame or (end_frame is not None):
+        print(f"  Frame range: [{reader.start_frame}, {reader.end_frame}) "
+              f"({(reader.end_frame - reader.start_frame) / reader.fps:.1f}s)")
     print(f"  Video: {reader.width}x{reader.height} @ {reader.fps:.1f}fps")
     print(f"  Duration: {reader.duration_s:.0f}s ({reader.total_frames} frames)")
     print(f"  Processing: ~{reader.frames_to_process} frames")
@@ -155,8 +186,10 @@ def run(video_path: str, output_dir: str, model_name: str = None,
         else:
             print(f"  ⚠️  Ensemble model not found: {ensemble_model_name} — skipping ensemble")
 
-    # CV-based ball gate — tracks ball trajectory to pick the best Hough circle
-    cv_gate = CVBallGate()
+    # Two-pass ball detection:
+    #   Pass 1 (per-frame loop): collect YOLO ball dets + Hough circle candidates
+    #   Pass 2 (post-processing): static-filter YOLO, then run CVBallGate
+    hough_candidates_by_frame = {}  # frame_num -> [(cx, cy, r), ...]
 
     with reader:
         pbar = tqdm(total=reader.frames_to_process, desc="Detecting", unit="frame")
@@ -174,13 +207,14 @@ def run(video_path: str, output_dir: str, model_name: str = None,
                 classes=person_class_ids,
             )
 
-            # Separate low-confidence ball predict (no tracking — ball has no persistent ID)
-            ball_results = model.predict(
+            # Separate low-confidence ball predict — uses dedicated model instance
+            # to avoid corrupting the tracking predictor's persistent state.
+            ball_results = ball_model.predict(
                 frame,
                 conf=ball_conf,
                 device=device,
                 verbose=False,
-                classes=[config.BALL_CLASS_ID],
+                classes=[ball_class_id],
             )
 
             # --- Process person tracking results ---
@@ -230,29 +264,13 @@ def run(video_path: str, output_dir: str, model_name: str = None,
                     ball_detections.append(det)
                     yolo_ball_this_frame.append(bbox)
 
-            # --- CV ball detection (Hough + gate) ---
-            # Seed gate from YOLO when available; otherwise select best Hough circle
-            if yolo_ball_this_frame:
-                # Use YOLO detection to update gate position
-                bx = yolo_ball_this_frame[0]
-                cv_gate.seed((bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2)
-            else:
-                hough_candidates = detect_hough_candidates(frame, y_min, y_max)
-                selected = cv_gate.select(hough_candidates)
-                if selected is not None:
-                    cx, cy, r = selected
-                    ball_detections.append({
-                        "frame_num": frame_num,
-                        "track_id": -1,
-                        "bbox": [cx - r, cy - r, cx + r, cy + r],
-                        "confidence": 0.40,
-                        "class_id": config.BALL_CLASS_ID,
-                        "source": "cv_hough",
-                    })
+            # --- Collect Hough candidates for pass-2 gated tracking ---
+            hough_candidates_by_frame[frame_num] = detect_hough_candidates(
+                frame, y_min, y_max)
 
             # Ensemble: run second model for ball detection only, merge with IoU dedup
             if ensemble_model is not None:
-                ens_results = ensemble_model.predict(
+                ens_results = ball_model.predict(
                     frame, conf=ball_conf, classes=[ensemble_ball_cls],
                     device=device, verbose=False,
                 )
@@ -292,12 +310,62 @@ def run(video_path: str, output_dir: str, model_name: str = None,
             pbar.update(1)
         pbar.close()
 
-    # Post-process: drop static false positives (field markings, cursor artifact)
+    # Post-process: drop static YOLO false positives (field markings, cursor)
     ball_before_filter = len(ball_detections)
     ball_detections = filter_static_ball_detections(ball_detections)
     n_removed = ball_before_filter - len(ball_detections)
     if n_removed:
         print(f"  Static filter: removed {n_removed} static ball false positives")
+
+    # Pass 2: Run CV gate tracker over Hough candidates.
+    # Seeding strategy: use player-foot proximity (ball is near feet during play).
+    # Falls back to filtered YOLO only when no foot-proximity circle is found.
+    from collections import defaultdict
+    person_by_frame = defaultdict(list)
+    for d in all_detections:
+        if not d.get("interpolated"):
+            person_by_frame[d["frame_num"]].append(d["bbox"])
+
+    cv_gate = CVBallGate()
+    cv_added = 0
+    all_processed_frames = sorted(hough_candidates_by_frame.keys())
+    for fnum in all_processed_frames:
+        candidates = hough_candidates_by_frame.get(fnum, [])
+        persons = person_by_frame.get(fnum, [])
+
+        if cv_gate.has_estimate:
+            # Gate is tracking — pick closest circle to predicted position
+            selected = cv_gate.select(candidates)
+            if selected is not None:
+                cx, cy, r = selected
+                ball_detections.append({
+                    "frame_num": fnum,
+                    "track_id": -1,
+                    "bbox": [cx - r, cy - r, cx + r, cy + r],
+                    "confidence": 0.40,
+                    "class_id": config.BALL_CLASS_ID,
+                    "source": "cv_hough",
+                })
+                cv_added += 1
+        else:
+            # Gate lost or never initialised — seed from foot-proximity
+            foot_circle = find_nearest_to_feet(candidates, persons, max_dist=80)
+            if foot_circle is not None:
+                cx, cy, r = foot_circle
+                cv_gate.seed(cx, cy)
+                ball_detections.append({
+                    "frame_num": fnum,
+                    "track_id": -1,
+                    "bbox": [cx - r, cy - r, cx + r, cy + r],
+                    "confidence": 0.35,
+                    "class_id": config.BALL_CLASS_ID,
+                    "source": "cv_hough_foot",
+                })
+                cv_added += 1
+
+    del hough_candidates_by_frame
+    if cv_added:
+        print(f"  CV Hough gate (pass 2): added {cv_added} ball detections")
 
     # Post-process: Kalman ball interpolation to fill short gaps
     try:
