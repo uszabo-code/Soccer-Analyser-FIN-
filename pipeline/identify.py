@@ -1,6 +1,7 @@
-"""Stage 2: Player identification via jersey number OCR and color clustering."""
+"""Stage 2: Player identification via interactive picker (primary) or jersey OCR (fallback)."""
 
 import json
+import math
 import os
 from collections import Counter, defaultdict
 
@@ -10,19 +11,26 @@ from tqdm import tqdm
 
 import config
 from models.data import Detection, PlayerIdentity
-from utils.ocr import read_jersey_number, read_jersey_number_multi, get_dominant_color, color_to_name
+from utils.ocr import read_jersey_number_multi, get_dominant_color, color_to_name
 from utils.video import VideoReader
 
 
 def run(video_path: str, detections_path: str, output_dir: str,
-        target_jersey: int) -> str:
+        target_jersey: int = None) -> str:
     """
-    Identify players by jersey number and cluster into teams.
+    Identify the target player and cluster all players into teams.
+
+    If target_jersey is given, attempts OCR to find that number; falls back to
+    interactive picker if OCR fails. If target_jersey is None, opens the
+    interactive picker immediately.
 
     Returns path to the output player identity JSON file.
     """
     print(f"\n[Stage 2] Player Identification")
-    print(f"  Target jersey number: {target_jersey}")
+    if target_jersey:
+        print(f"  Target jersey number: {target_jersey}")
+    else:
+        print(f"  Mode: interactive player selection")
 
     # Load detections
     with open(detections_path) as f:
@@ -42,112 +50,41 @@ def run(video_path: str, detections_path: str, output_dir: str,
     print(f"  Total tracks: {len(tracks)}")
 
     # Filter to significant tracks only — scale with frame_skip
-    # FRAME_SKIP=3 → 30 dets (~2-3s), FRAME_SKIP=1 → 90 dets (~2-3s)
     frame_skip = det_data.get("frame_skip", config.FRAME_SKIP)
     MIN_TRACK_LENGTH = max(30, int(90 / frame_skip))
     significant_tracks = {tid: dets for tid, dets in tracks.items() if len(dets) >= MIN_TRACK_LENGTH}
     print(f"  Significant tracks (>={MIN_TRACK_LENGTH} detections): {len(significant_tracks)}")
 
-    # For each track, select frames where player is largest (best OCR candidates)
-    reader = VideoReader(video_path, frame_skip=1)  # Need full access for specific frames
-
-    track_ocr_results = {}  # track_id -> list of OCR results
-    track_colors = {}  # track_id -> list of (H,S,V)
-
-    print("  Running jersey number OCR...")
-    for track_id, dets in tqdm(significant_tracks.items(), desc="OCR", unit="track"):
-        # Sort by bbox height (largest first) for best OCR candidates
-        sorted_dets = sorted(dets, key=lambda d: d.height, reverse=True)
-        # 5 best samples — multi-strategy gives 3 candidates per frame already
-        ocr_samples = sorted_dets[:min(5, config.OCR_SAMPLES_PER_TRACK)]
-        color_samples = sorted_dets[:3]
-
-        ocr_numbers = []
-        colors = []
-
-        # Skip OCR entirely if largest bbox is too small to read
-        skip_ocr = sorted_dets[0].height < config.MIN_PLAYER_HEIGHT_PX if sorted_dets else True
-
-        # Color extraction first (fast)
-        for det in color_samples:
-            frame = reader.read_frame(det.frame_num)
-            if frame is None:
-                continue
-            x1, y1, x2, y2 = det.bbox
-            pad_x = (x2 - x1) * config.JERSEY_CROP_PADDING
-            pad_y = (y2 - y1) * config.JERSEY_CROP_PADDING
-            cx1 = max(0, int(x1 - pad_x))
-            cy1 = max(0, int(y1 - pad_y))
-            cx2 = min(frame_width, int(x2 + pad_x))
-            cy2 = min(frame_height, int(y2 + pad_y))
-            crop = frame[cy1:cy2, cx1:cx2]
-            if crop.size > 0:
-                colors.append(get_dominant_color(crop))
-
-        for det in ocr_samples:
-            if skip_ocr:
-                break
-            if det.height < config.MIN_PLAYER_HEIGHT_PX:
-                continue
-
-            frame = reader.read_frame(det.frame_num)
-            if frame is None:
-                continue
-
-            # Crop with padding
-            x1, y1, x2, y2 = det.bbox
-            pad_x = (x2 - x1) * config.JERSEY_CROP_PADDING
-            pad_y = (y2 - y1) * config.JERSEY_CROP_PADDING
-            cx1 = max(0, int(x1 - pad_x))
-            cy1 = max(0, int(y1 - pad_y))
-            cx2 = min(frame_width, int(x2 + pad_x))
-            cy2 = min(frame_height, int(y2 + pad_y))
-            crop = frame[cy1:cy2, cx1:cx2]
-
-            if crop.size == 0:
-                continue
-
-            # OCR on upper body (jersey area) using multi-strategy
-            jersey_crop = crop[:int(crop.shape[0] * 0.6), :]
-            if jersey_crop.size > 0:
-                candidates = read_jersey_number_multi(jersey_crop)
-                ocr_numbers.extend(candidates)
-
-        track_ocr_results[track_id] = ocr_numbers
-        if colors:
-            track_colors[track_id] = np.mean(colors, axis=0).tolist()
-
+    # --- Step 1: Extract jersey colors for all significant tracks (needed for team clustering) ---
+    reader = VideoReader(video_path, frame_skip=1)
+    track_colors = _extract_colors(significant_tracks, reader, frame_width, frame_height)
     reader.close()
 
-    # Assign jersey numbers by majority vote
+    # --- Step 2: Identify target player ---
+    target_track_ids = []
     track_jerseys = {}
-    for track_id, numbers in track_ocr_results.items():
-        if numbers:
-            counter = Counter(numbers)
-            most_common_num, count = counter.most_common(1)[0]
-            if count >= config.OCR_MIN_VOTES:
-                track_jerseys[track_id] = most_common_num
 
-    print(f"  Identified {len(track_jerseys)} tracks with jersey numbers: "
-          f"{dict(sorted(track_jerseys.items(), key=lambda x: x[1]))}")
-
-    # Find target player
-    target_track_ids = [tid for tid, num in track_jerseys.items() if num == target_jersey]
+    if target_jersey:
+        # Try OCR first
+        reader = VideoReader(video_path, frame_skip=1)
+        track_jerseys = _run_ocr(significant_tracks, reader, frame_width, frame_height)
+        reader.close()
+        target_track_ids = [tid for tid, num in track_jerseys.items() if num == target_jersey]
+        if target_track_ids:
+            print(f"  OCR found jersey #{target_jersey}: track IDs {target_track_ids}")
+        else:
+            print(f"  OCR could not find jersey #{target_jersey}. Opening interactive picker...")
 
     if not target_track_ids:
-        print(f"  WARNING: Could not find jersey #{target_jersey} via OCR.")
-        print(f"  Available numbers: {sorted(set(track_jerseys.values()))}")
-        # Skip interactive fallback (blocks in headless/CLI context)
-        # Instead, pick the longest unidentified track as best guess
-        print(f"  Skipping interactive selection — will use largest unidentified track.")
+        # Interactive picker — primary path when no jersey given, fallback when OCR fails
+        target_track_ids = _interactive_select(video_path, tracks, det_data, fps)
 
-    if target_track_ids:
-        print(f"  Target player found: track IDs {target_track_ids}")
-    else:
+    if not target_track_ids:
         print(f"  WARNING: Could not identify target player. Will analyze largest track.")
-        # Fall back to the track with the most detections
         largest_track = max(tracks.keys(), key=lambda tid: len(tracks[tid]))
         target_track_ids = [largest_track]
+    else:
+        print(f"  Target player: track IDs {target_track_ids}")
 
     # Cluster tracks into teams by jersey color
     teams = _cluster_teams(track_colors, tracks)
@@ -158,6 +95,22 @@ def run(video_path: str, detections_path: str, output_dir: str,
         if any(tid in team_track_ids for tid in target_track_ids):
             target_team = team_name
             break
+
+    # --- Step 3: Sweep for additional target fragments ---
+    # After OCR/picker gives us a seed set, find all other same-team tracks that
+    # are temporally adjacent + spatially plausible + color-similar. These are
+    # additional fragments of the same player that OCR missed (e.g. the player
+    # was off-screen for >5s and got a new track ID when they re-entered frame).
+    if target_track_ids and target_team != "unknown":
+        target_track_ids = _sweep_for_target_fragments(
+            target_track_ids=target_track_ids,
+            significant_tracks=significant_tracks,
+            track_colors=track_colors,
+            teams=teams,
+            target_team=target_team,
+            fps=fps,
+            frame_width=frame_width,
+        )
 
     # Build player identities (only for significant tracks)
     players = []
@@ -201,6 +154,65 @@ def run(video_path: str, detections_path: str, output_dir: str,
 
     print(f"  Saved to {output_path}")
     return output_path
+
+
+def _extract_colors(significant_tracks: dict, reader, frame_width: int, frame_height: int) -> dict:
+    """Extract dominant HSV jersey color for each significant track."""
+    track_colors = {}
+    for track_id, dets in significant_tracks.items():
+        sorted_dets = sorted(dets, key=lambda d: d.height, reverse=True)
+        colors = []
+        for det in sorted_dets[:3]:
+            frame = reader.read_frame(det.frame_num)
+            if frame is None:
+                continue
+            x1, y1, x2, y2 = det.bbox
+            pad_x = (x2 - x1) * config.JERSEY_CROP_PADDING
+            pad_y = (y2 - y1) * config.JERSEY_CROP_PADDING
+            crop = frame[
+                max(0, int(y1 - pad_y)):min(frame_height, int(y2 + pad_y)),
+                max(0, int(x1 - pad_x)):min(frame_width, int(x2 + pad_x)),
+            ]
+            if crop.size > 0:
+                colors.append(get_dominant_color(crop))
+        if colors:
+            track_colors[track_id] = np.mean(colors, axis=0).tolist()
+    return track_colors
+
+
+def _run_ocr(significant_tracks: dict, reader, frame_width: int, frame_height: int) -> dict:
+    """Run jersey number OCR on significant tracks. Returns {track_id: jersey_number}."""
+    track_jerseys = {}
+    print("  Running jersey number OCR...")
+    for track_id, dets in tqdm(significant_tracks.items(), desc="OCR", unit="track"):
+        sorted_dets = sorted(dets, key=lambda d: d.height, reverse=True)
+        if not sorted_dets or sorted_dets[0].height < config.MIN_PLAYER_HEIGHT_PX:
+            continue
+        ocr_numbers = []
+        for det in sorted_dets[:min(5, config.OCR_SAMPLES_PER_TRACK)]:
+            if det.height < config.MIN_PLAYER_HEIGHT_PX:
+                continue
+            frame = reader.read_frame(det.frame_num)
+            if frame is None:
+                continue
+            x1, y1, x2, y2 = det.bbox
+            pad_x = (x2 - x1) * config.JERSEY_CROP_PADDING
+            pad_y = (y2 - y1) * config.JERSEY_CROP_PADDING
+            crop = frame[
+                max(0, int(y1 - pad_y)):min(frame_height, int(y2 + pad_y)),
+                max(0, int(x1 - pad_x)):min(frame_width, int(x2 + pad_x)),
+            ]
+            if crop.size == 0:
+                continue
+            jersey_crop = crop[:int(crop.shape[0] * 0.6), :]
+            if jersey_crop.size > 0:
+                ocr_numbers.extend(read_jersey_number_multi(jersey_crop))
+        if ocr_numbers:
+            counter = Counter(ocr_numbers)
+            best_num, count = counter.most_common(1)[0]
+            if count >= config.OCR_MIN_VOTES:
+                track_jerseys[track_id] = best_num
+    return track_jerseys
 
 
 def _cluster_teams(track_colors: dict, tracks: dict) -> dict:
@@ -247,69 +259,248 @@ def _cluster_teams(track_colors: dict, tracks: dict) -> dict:
         return {"team_a": all_tids[:mid], "team_b": all_tids[mid:]}
 
 
-def _interactive_select(video_path: str, tracks: dict, det_data: dict) -> list:
+def _sweep_for_target_fragments(
+    target_track_ids: list,
+    significant_tracks: dict,
+    track_colors: dict,
+    teams: dict,
+    target_team: str,
+    fps: float,
+    frame_width: int,
+) -> list:
     """
-    Fallback: show a frame and let the user click on their player.
-    Returns list of track_ids or empty list if not possible.
+    Expand target_track_ids by finding same-player fragments missed by OCR/picker.
+
+    After OCR or the interactive picker gives us a seed set of target track IDs,
+    many more fragments of the same player may exist in the game — the tracker lost
+    the player and reacquired them under a different ID. This sweep finds those
+    additional fragments by checking three conditions per candidate track:
+
+      1. Same team colour (already filtered by 'teams' dict)
+      2. Temporally adjacent to a known target fragment (gap ≤ SWEEP_MAX_GAP_FRAMES)
+      3. Spatially plausible: last known target position → candidate start within
+         the distance a player could run in the gap time
+      4. HSV colour similarity: candidate hue matches target median hue
+
+    Runs iteratively until no new fragments are added (convergence).
+
+    Returns the (possibly expanded) list of target_track_ids.
+    """
+    SWEEP_MAX_GAP_FRAMES = 1800   # 60s — covers substitution delays, off-field moments
+    SWEEP_HUE_TOLERANCE = 30      # Max hue difference (0-180 scale)
+    MAX_SPEED_MPS = 8.0           # Physics cap (same as Stage 1b)
+    JITTER_PX = 50                # Spatial jitter buffer
+
+    try:
+        from config import FIELD_WIDTH_METERS
+        px_per_meter = frame_width / FIELD_WIDTH_METERS
+    except Exception:
+        px_per_meter = frame_width / 68.0
+
+    # Build endpoints for all significant tracks
+    def _endpoints(dets):
+        sd = sorted(dets, key=lambda d: d.frame_num)
+        return {
+            "first_frame": sd[0].frame_num,
+            "last_frame": sd[-1].frame_num,
+            "first_pos": sd[0].center,
+            "last_pos": sd[-1].center,
+        }
+
+    all_eps = {tid: _endpoints(dets) for tid, dets in significant_tracks.items()}
+
+    # Target's median HSV color signature
+    target_colors_available = [track_colors[tid] for tid in target_track_ids
+                                if tid in track_colors]
+    if not target_colors_available:
+        return target_track_ids  # No color info — can't sweep
+
+    target_hue = float(np.median([c[0] for c in target_colors_available]))
+
+    # Candidate pool: same-team tracks not already in target
+    same_team_tracks = set(teams.get(target_team, []))
+
+    current_ids = list(target_track_ids)
+    found_new = True
+
+    while found_new:
+        found_new = False
+        candidate_ids = same_team_tracks - set(current_ids)
+
+        for cid in candidate_ids:
+            if cid not in all_eps or cid not in track_colors:
+                continue
+
+            cep = all_eps[cid]
+            c_hue = track_colors[cid][0]
+
+            # Check 4: HSV hue similarity
+            h_diff = min(abs(target_hue - c_hue), 180.0 - abs(target_hue - c_hue))
+            if h_diff > SWEEP_HUE_TOLERANCE:
+                continue
+
+            # Pre-check: reject candidate if it overlaps ANY confirmed target fragment.
+            # The inner adjacency loop's `else: continue` only skips one pair — if the
+            # candidate overlaps fragment A but is adjacent to fragment B, it would still
+            # be added via fragment B without this guard.
+            has_overlap = any(
+                cep["first_frame"] <= all_eps[kid]["last_frame"]
+                and cep["last_frame"] >= all_eps[kid]["first_frame"]
+                for kid in current_ids
+                if kid in all_eps
+            )
+            if has_overlap:
+                continue
+
+            # Check 2 & 3: temporal adjacency + spatial plausibility vs any known fragment
+            for kid in current_ids:
+                if kid not in all_eps:
+                    continue
+                kep = all_eps[kid]
+
+                # Which ends first: known fragment or candidate?
+                if kep["last_frame"] < cep["first_frame"]:
+                    gap = cep["first_frame"] - kep["last_frame"]
+                    pos_from, pos_to = kep["last_pos"], cep["first_pos"]
+                elif cep["last_frame"] < kep["first_frame"]:
+                    gap = kep["first_frame"] - cep["last_frame"]
+                    pos_from, pos_to = cep["last_pos"], kep["first_pos"]
+                else:
+                    continue  # Temporal overlap — different player
+
+                if gap > SWEEP_MAX_GAP_FRAMES:
+                    continue
+
+                # Physics check
+                gap_s = gap / max(fps, 1.0)
+                max_dist_px = MAX_SPEED_MPS * gap_s * px_per_meter + JITTER_PX
+                dx = pos_to[0] - pos_from[0]
+                dy = pos_to[1] - pos_from[1]
+                actual_dist = math.sqrt(dx * dx + dy * dy)
+
+                if actual_dist <= max_dist_px:
+                    current_ids.append(cid)
+                    found_new = True
+                    break  # No need to check remaining known fragments
+
+    added = len(current_ids) - len(target_track_ids)
+    if added > 0:
+        print(f"  Target sweep: found {added} additional fragment(s) → "
+              f"{len(current_ids)} total track IDs for target player")
+
+    return current_ids
+
+
+def _interactive_select(video_path: str, tracks: dict, det_data: dict, fps: float) -> list:
+    """
+    Show a video frame and let the user click on their player.
+    Arrow keys navigate between candidate frames (t=20s to t=90s).
+    Returns list containing the selected track_id, or empty list on cancel.
     """
     try:
-        # Find a frame in the middle of the video with many detections
-        mid_frame_approx = det_data["total_frames"] // 2
         dets_by_frame = defaultdict(list)
         for d in det_data["person_detections"]:
             dets_by_frame[d["frame_num"]].append(d)
 
-        # Find frame closest to midpoint with good detection count
-        best_frame = min(dets_by_frame.keys(), key=lambda f: abs(f - mid_frame_approx))
-
-        reader = VideoReader(video_path, frame_skip=1)
-        frame = reader.read_frame(best_frame)
-        reader.close()
-
-        if frame is None:
+        # Build candidate frames: ~10 evenly spaced frames from t=20s to t=90s
+        t_start = int(fps * 20)
+        t_end = int(fps * min(90, det_data["total_frames"] / fps - 5))
+        available = sorted(dets_by_frame.keys())
+        candidates = [f for f in available if t_start <= f <= t_end]
+        if not candidates:
+            candidates = available[:20]
+        step = max(1, len(candidates) // 10)
+        candidate_frames = candidates[::step][:10]
+        if not candidate_frames:
             return []
 
-        # Draw bounding boxes with track IDs
-        for det in dets_by_frame[best_frame]:
-            x1, y1, x2, y2 = [int(c) for c in det["bbox"]]
-            tid = det["track_id"]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"T{tid}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        reader = VideoReader(video_path, frame_skip=1)
 
-        # Show and wait for click
-        selected = []
+        WIN = "Click your player | Left/Right = change frame | Enter = confirm | Esc = cancel"
+        DISPLAY_H = 720
+
+        state = {"frame_idx": 0, "selected_tid": None, "confirmed": False, "cancelled": False}
+
+        def _render(raw_frame, frame_dets, selected_tid, frame_idx, total):
+            """Draw bboxes and instructions onto a display-sized copy."""
+            h, w = raw_frame.shape[:2]
+            scale = DISPLAY_H / h
+            display_w = int(w * scale)
+            img = cv2.resize(raw_frame, (display_w, DISPLAY_H))
+
+            for det in frame_dets:
+                x1, y1, x2, y2 = [int(c * scale) for c in det["bbox"]]
+                tid = det["track_id"]
+                color = (0, 220, 0) if tid == selected_tid else (200, 200, 200)
+                thickness = 3 if tid == selected_tid else 1
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+            # Instruction overlay
+            t = int(candidate_frames[frame_idx] / fps)
+            info = f"Frame {frame_idx + 1}/{total}  t={t // 60}:{t % 60:02d}"
+            if selected_tid is not None:
+                info += f"  | Selected: track {selected_tid}"
+            cv2.rectangle(img, (0, 0), (display_w, 28), (0, 0, 0), -1)
+            cv2.putText(img, info, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            hint = "Left/Right: change frame  |  Click: select player  |  Enter: confirm  |  Esc: cancel"
+            cv2.rectangle(img, (0, DISPLAY_H - 28), (display_w, DISPLAY_H), (0, 0, 0), -1)
+            cv2.putText(img, hint, (6, DISPLAY_H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            return img, scale
 
         def on_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN:
-                for det in dets_by_frame[best_frame]:
-                    bx1, by1, bx2, by2 = [int(c) for c in det["bbox"]]
-                    if bx1 <= x <= bx2 and by1 <= y <= by2:
-                        selected.append(det["track_id"])
-                        print(f"  Selected track ID: {det['track_id']}")
-                        break
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+            fi = state["frame_idx"]
+            frame_dets = dets_by_frame[candidate_frames[fi]]
+            scale = param["scale"]
+            for det in frame_dets:
+                bx1, by1, bx2, by2 = [int(c * scale) for c in det["bbox"]]
+                if bx1 <= x <= bx2 and by1 <= y <= by2:
+                    state["selected_tid"] = det["track_id"]
+                    break
 
-        cv2.namedWindow("Click on your player (press 'q' to confirm)")
-        cv2.setMouseCallback("Click on your player (press 'q' to confirm)", on_click)
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN, int(DISPLAY_H * det_data["width"] / det_data["height"]), DISPLAY_H + 30)
 
-        # Resize for display if needed
-        display_h = 720
-        scale = display_h / frame.shape[0]
-        display_frame = cv2.resize(frame, (int(frame.shape[1] * scale), display_h))
+        print(f"  Interactive picker open — navigate frames with Left/Right, click your player, Enter to confirm.")
 
-        cv2.imshow("Click on your player (press 'q' to confirm)", display_frame)
-        print("  A window has opened. Click on your son in the image, then press 'q' to confirm.")
+        scale_ref = {"scale": 1.0}
+        cv2.setMouseCallback(WIN, on_click, scale_ref)
 
-        while True:
-            key = cv2.waitKey(100) & 0xFF
-            if key == ord("q") and selected:
-                break
-            if key == 27:  # ESC to cancel
-                selected = []
-                break
+        raw_cache = {}
 
+        while not state["confirmed"] and not state["cancelled"]:
+            fi = state["frame_idx"]
+            fn = candidate_frames[fi]
+
+            if fn not in raw_cache:
+                raw_cache[fn] = reader.read_frame(fn)
+            raw = raw_cache[fn]
+            if raw is None:
+                state["frame_idx"] = (fi + 1) % len(candidate_frames)
+                continue
+
+            img, scale = _render(raw, dets_by_frame[fn], state["selected_tid"], fi, len(candidate_frames))
+            scale_ref["scale"] = scale
+            cv2.imshow(WIN, img)
+
+            key = cv2.waitKey(50) & 0xFF
+            if key in (81, 2):  # Left arrow
+                state["frame_idx"] = (fi - 1) % len(candidate_frames)
+            elif key in (83, 3):  # Right arrow
+                state["frame_idx"] = (fi + 1) % len(candidate_frames)
+            elif key == 13 and state["selected_tid"] is not None:  # Enter
+                state["confirmed"] = True
+            elif key == 27:  # Esc
+                state["cancelled"] = True
+
+        reader.close()
         cv2.destroyAllWindows()
-        return list(set(selected))
+
+        if state["confirmed"] and state["selected_tid"] is not None:
+            print(f"  Player selected: track ID {state['selected_tid']}")
+            return [state["selected_tid"]]
+        return []
 
     except Exception as e:
         print(f"  Interactive selection failed: {e}")
